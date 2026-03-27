@@ -41,7 +41,7 @@ module alu_tb;
         ALU_SLTU:   ref_alu = {{(XLEN-1){1'b0}}, (a < b)};
         ALU_XOR:    ref_alu = a ^ b;
         ALU_SRL:    ref_alu = a >> shamt;
-        ALU_SRA:    ref_alu = logic'(as >>> shamt);
+        ALU_SRA:    ref_alu = as >>> shamt;
         ALU_OR:     ref_alu = a | b;
         ALU_AND:    ref_alu = a & b;
         ALU_COPY_B: ref_alu = b;
@@ -57,7 +57,7 @@ module alu_tb;
           end else if ((a == 32'h8000_0000) && (b == 32'hFFFF_FFFF)) begin
             ref_alu = a;
           end else begin
-            ref_alu = logic'($signed(a) / $signed(b));
+            ref_alu = $signed(a) / $signed(b);
           end
         end
 
@@ -75,7 +75,7 @@ module alu_tb;
           end else if ((a == 32'h8000_0000) && (b == 32'hFFFF_FFFF)) begin
             ref_alu = '0;
           end else begin
-            ref_alu = logic'($signed(a) % $signed(b));
+            ref_alu = $signed(a) % $signed(b);
           end
         end
 
