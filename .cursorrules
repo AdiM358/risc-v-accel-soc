@@ -1,0 +1,536 @@
+# Project: RISC-V SoC with INT8 Systolic Array Accelerator
+# Target: Zynq-7020 (Digilent Zybo Z7-20 or Arty Z7-20)
+# Toolchain: Vivado 2023.x, Verilator, SymbiYosys, ModelSim
+# HDL: SystemVerilog exclusively (no VHDL, no plain Verilog)
+
+---
+
+## Project Overview
+
+I am building a complete SoC in SystemVerilog targeting a Xilinx Zynq-7020 FPGA 
+as a portfolio project for ASIC/FPGA new grad job applications. The system consists 
+of three major components that will be integrated together:
+
+1. A 5-stage pipelined RISC-V RV32IM CPU implemented in the Zynq PL fabric
+2. An INT8 8x8 systolic array matrix multiply accelerator in the Zynq PL fabric
+3. AXI4-Lite and AXI4-Stream interconnect allowing the Zynq PS (ARM Cortex-A9) 
+   to orchestrate the accelerator
+
+The project also includes:
+- A UVM testbench for the accelerator targeting >90% functional coverage
+- SymbiYosys formal verification for the AXI slave and CPU hazard unit
+- Bare-metal C software running on the PS side to drive and benchmark the accelerator
+- Full documentation including timing reports, utilization reports, and block diagrams
+
+This is NOT a toy project. Every design decision should reflect industry best 
+practices for RTL design. Code must be synthesizable unless explicitly in a 
+testbench context.
+
+---
+
+## Repository Structure
+
+Maintain this exact directory structure at all times:
+
+risc-v-cnn-accel/
+├── rtl/
+│   ├── cpu/
+│   │   ├── fetch.sv
+│   │   ├── decode.sv
+│   │   ├── execute.sv
+│   │   ├── mem.sv
+│   │   ├── writeback.sv
+│   │   ├── regfile.sv
+│   │   ├── hazard_unit.sv
+│   │   ├── forward_unit.sv
+│   │   ├── alu.sv
+│   │   └── cpu_top.sv
+│   ├── accelerator/
+│   │   ├── pe.sv
+│   │   ├── pe_array.sv
+│   │   ├── weight_buffer.sv
+│   │   ├── input_buffer.sv
+│   │   ├── output_buffer.sv
+│   │   ├── control_fsm.sv
+│   │   └── accel_top.sv
+│   └── soc/
+│       ├── axi4_lite_slave.sv
+│       ├── axi4_stream_input.sv
+│       └── soc_top.sv
+├── tb/
+│   ├── sim/
+│   │   ├── cpu_tb.sv
+│   │   └── accel_tb.sv
+│   └── uvm/
+│       ├── accel_if.sv
+│       ├── accel_seq_item.sv
+│       ├── accel_driver.sv
+│       ├── accel_monitor.sv
+│       ├── accel_scoreboard.sv
+│       ├── accel_coverage.sv
+│       ├── accel_agent.sv
+│       ├── accel_env.sv
+│       └── accel_test.sv
+├── sw/
+│   ├── tests/
+│   │   └── matmul_test.s        # Assembly tests for CPU
+│   └── driver/
+│       └── accel_driver.c       # Bare-metal PS-side driver
+├── constraints/
+│   └── zybo_z7.xdc
+├── formal/
+│   ├── axi_slave.sby
+│   └── hazard_unit.sby
+├── scripts/
+│   ├── simulate.sh
+│   ├── synth.tcl
+│   └── gen_test_vectors.py
+├── docs/
+│   ├── architecture.md
+│   ├── block_diagram.drawio
+│   └── reports/
+└── README.md
+
+---
+
+## Coding Standards — Enforce These In Every File
+
+### General RTL Rules
+- All RTL is synthesizable SystemVerilog (IEEE 1800-2017)
+- Never use initial blocks in synthesizable RTL (only in testbenches)
+- Never use #delays in synthesizable RTL
+- Use always_ff for sequential logic, always_comb for combinational logic
+- Never use always @ — always use always_ff or always_comb
+- Use logic type exclusively — never use reg or wire
+- All module ports must have explicit direction and type
+- Every module must have a file header comment block (see template below)
+- Reset is synchronous, active-low (rst_n) throughout the entire design
+- Clock is always named clk
+- Parameterize everything that could reasonably vary:
+  - DATA_WIDTH, ADDR_WIDTH, ARRAY_SIZE, etc.
+- Use localparam for constants internal to a module
+- Use package files for shared typedefs and parameters
+
+### Naming Conventions
+- Module names: snake_case (e.g., pe_array, hazard_unit)
+- Signal names: snake_case (e.g., rd_addr, wr_en)
+- Parameters: UPPER_SNAKE_CASE (e.g., DATA_WIDTH, ARRAY_SIZE)
+- Constants/localparams: UPPER_SNAKE_CASE
+- Active-low signals: suffix _n (e.g., rst_n, valid_n)
+- Registered signals: suffix _r (e.g., data_r, state_r)
+- Next-state signals: suffix _next (e.g., state_next, count_next)
+- Interface signals follow AXI naming convention exactly where applicable
+
+### File Header Template (use on every file)
+//=============================================================================
+// Module: <module_name>
+// Description: <one line description>
+//
+// Parameters:
+//   <PARAM_NAME> - <description> (default: <value>)
+//
+// Ports:
+//   <port_name> - <direction> - <description>
+//
+// Dependencies:
+//   <list any submodules instantiated>
+//
+// Notes:
+//   <any implementation notes, timing constraints, known limitations>
+//=============================================================================
+
+---
+
+## Phase 1: RISC-V RV32IM CPU
+
+### Architecture Specification
+
+Implement a classic 5-stage in-order pipeline:
+  IF → ID → EX → MEM → WB
+
+Pipeline registers between every stage:
+  if_id_r, id_ex_r, ex_mem_r, mem_wb_r
+
+Each pipeline register is a packed struct defined in a package file.
+
+### Hazard Handling
+- Full forwarding paths: EX/MEM → EX, MEM/WB → EX
+- Load-use hazard: insert one bubble (stall IF and ID, flush EX)
+- Control hazard: assume not-taken, flush on misprediction (2-cycle penalty)
+- Forwarding unit is a separate module (forward_unit.sv)
+- Hazard detection unit is a separate module (hazard_unit.sv)
+
+### Instruction Set
+Implement full RV32IM:
+- RV32I base: all integer instructions including LUI, AUIPC, JAL, JALR,
+  all branch types, all load types, all store types, all immediate arithmetic,
+  all register arithmetic, FENCE (NOP), ECALL/EBREAK (NOP)
+- M extension: MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
+  (Use DSP48 primitives for multiply, iterative division is acceptable)
+
+### Memory Interface
+- Separate instruction memory and data memory (Harvard architecture)
+- Both are synchronous BRAM with 1-cycle read latency
+- Size: 64KB instruction memory, 64KB data memory (parameterizable)
+- BRAM instantiation must use Xilinx BRAM primitives for synthesis
+  (use behavioral model in simulation)
+
+### Performance Target
+- Achieve timing closure at ≥100MHz on Zynq-7020
+- Target utilization: <20,000 LUTs, <10,000 FFs, <8 BRAMs
+
+### Verification Requirements for CPU
+- Directed assembly tests for every instruction in /sw/tests/
+- Test back-to-back dependent instructions to verify forwarding
+- Test load-use hazard explicitly
+- Test branch taken and not-taken
+- Test all multiply/divide corner cases (divide by zero, overflow)
+- Simulate a complete bubble sort on 16 elements
+- Show all test results pass in README with waveform screenshots
+
+---
+
+## Phase 2: INT8 Systolic Array Accelerator
+
+### Architecture Specification
+
+Implement an NxN systolic array (default N=8, parameterized as ARRAY_SIZE).
+
+Dataflow: Weight-stationary
+- Weights are preloaded into each PE and held stationary
+- Input activations flow left-to-right across rows
+- Partial sums flow top-to-bottom through columns
+- Each PE computes: acc += weight * input (8-bit multiply, 32-bit accumulate)
+
+### Processing Element (pe.sv)
+Each PE contains:
+- 8-bit weight register (loaded during weight-loading phase)
+- 8-bit input register (loaded from left neighbor or input buffer)
+- 32-bit accumulator register
+- Computation: acc_r <= acc_r + (weight_r * data_in) on each clock
+- Outputs: data_out (passes input to right neighbor), acc_out (to south neighbor)
+- Control ports: load_weight, clear_acc, output_valid
+- Pipeline the multiply-accumulate to meet timing (register the product)
+
+### PE Array (pe_array.sv)
+- Instantiate ARRAY_SIZE x ARRAY_SIZE PEs
+- Wire correctly for weight-stationary systolic dataflow:
+  - pe[i][j].data_out → pe[i][j+1].data_in (left to right)
+  - pe[i][j].acc_out → pe[i+1][j].acc_in (top to bottom)
+  - pe[0][j] inputs connect to input_buffer row j
+  - pe[i][ARRAY_SIZE-1].acc_out connects to output_buffer column i
+- Generate block for instantiation — do not manually instantiate 64 PEs
+- Tie-off boundary conditions explicitly (first column acc_in = 0)
+
+### Memory Architecture
+Weight buffer:
+  - Dual-port BRAM, 8-bit wide, depth = ARRAY_SIZE * ARRAY_SIZE (64 entries)
+  - Written via AXI4-Lite interface during weight-loading phase
+  - Read port connects directly to PE array during compute phase
+
+Input buffer:
+  - Dual-port BRAM, 8-bit wide, depth = ARRAY_SIZE * ARRAY_SIZE (64 entries)
+  - Written via AXI4-Stream interface for streaming inputs
+  - Read port streams into PE array row inputs during compute phase
+
+Output buffer:
+  - Registers (not BRAM), 32-bit wide, ARRAY_SIZE entries
+  - Captures final accumulator outputs from bottom row of PE array
+  - Read via AXI4-Lite interface after compute completes
+
+### Control FSM (control_fsm.sv)
+States (use enum typedef in package):
+  IDLE → LOAD_WEIGHTS → CLEAR_ACC → COMPUTE → OUTPUT_VALID → IDLE
+
+Transitions:
+  IDLE: wait for start pulse from AXI control register
+  LOAD_WEIGHTS: shift weights into PE array row by row (ARRAY_SIZE cycles)
+  CLEAR_ACC: broadcast clear_acc to all PEs (1 cycle)
+  COMPUTE: stream inputs through array (ARRAY_SIZE + ARRAY_SIZE - 1 cycles for 
+           full systolic fill), assert compute_done when last output valid
+  OUTPUT_VALID: assert output_valid, wait for read_done from AXI slave
+  IDLE: deassert everything, ready for next transaction
+
+### Performance Target
+- Achieve timing closure at ≥125MHz on Zynq-7020
+- DSP48 inference: PE multipliers must map to DSP48 slices
+  (use (* use_dsp = "yes" *) synthesis attribute)
+- Target utilization for accelerator: ~64 DSP48s, ~4 BRAMs, <5,000 LUTs
+
+---
+
+## Phase 3: AXI4 Integration
+
+### Memory Map
+Implement this exact memory map in the AXI4-Lite slave:
+
+Base address: 0x4000_0000 (connected to Zynq AXI_GP0 port)
+
+Offset 0x000 — CTRL register (W)
+  bit[0]: start (write 1 to begin computation, auto-clears)
+  bit[1]: reset accelerator (write 1, auto-clears)
+
+Offset 0x004 — STATUS register (R)
+  bit[0]: done (1 = computation complete, results readable)
+  bit[1]: busy (1 = computation in progress)
+  bit[2]: error (1 = AXI protocol violation detected)
+
+Offset 0x008 — CONFIG register (RW)
+  bits[7:0]: matrix_size (default 8)
+
+Offset 0x100-0x13F — WEIGHT_BUFFER (W) — 64 bytes, one per PE weight
+
+Offset 0x200-0x23F — OUTPUT_BUFFER (R) — 32 bytes, 8x 32-bit results
+
+### AXI4-Lite Slave (axi4_lite_slave.sv)
+Implement full AXI4-Lite slave protocol:
+- All 5 channels: AW, W, B, AR, R
+- VALID/READY handshake on every channel — never drop VALID once asserted
+  until READY is seen (this is the most commonly violated AXI rule)
+- BRESP and RRESP: return OKAY (2'b00) on success, SLVERR (2'b10) on 
+  invalid address
+- Single outstanding transaction only (no out-of-order support needed)
+- Include SVA assertions inline to verify handshake protocol is never violated:
+  // VALID must not deassert without a READY
+  assert property (@(posedge clk) disable iff (!rst_n)
+    s_axi_awvalid && !s_axi_awready |=> s_axi_awvalid);
+
+### AXI4-Stream Input Interface (axi4_stream_input.sv)
+- Accepts streaming input matrix data from PS side
+- TDATA: 8-bit (one element per beat)
+- TVALID/TREADY handshake
+- TLAST: asserted on final element of input matrix
+- Writes directly into input_buffer BRAM
+- Asserts stream_done to control FSM when TLAST received
+
+---
+
+## Phase 4: UVM Testbench
+
+### Environment Structure
+Follow standard UVM 1.2 class hierarchy:
+  uvm_test → uvm_env → uvm_agent → (uvm_driver + uvm_monitor)
+  uvm_env also contains: uvm_scoreboard, uvm_coverage_collector
+
+### Sequence Item (accel_seq_item.sv)
+class accel_seq_item extends uvm_sequence_item;
+  rand logic [7:0] weights [ARRAY_SIZE][ARRAY_SIZE];
+  rand logic [7:0] inputs  [ARRAY_SIZE][ARRAY_SIZE];
+  logic [31:0]     expected [ARRAY_SIZE][ARRAY_SIZE]; // computed by post_randomize
+  
+  // Constraints
+  constraint c_weight_range { foreach(weights[i,j]) weights[i][j] inside {[0:127]}; }
+  constraint c_input_range  { foreach(inputs[i,j])  inputs[i][j]  inside {[0:127]}; }
+  // Zero matrix test
+  constraint c_zero_weights { weights.sum() with (int'(item)) == 0; }
+  // Must enable/disable constraints in test
+
+  function void post_randomize();
+    // Compute expected output in pure SV for scoreboard reference
+    foreach(expected[i,j]) begin
+      expected[i][j] = 0;
+      for(int k=0; k<ARRAY_SIZE; k++)
+        expected[i][j] += weights[i][k] * inputs[k][j];
+    end
+  endfunction
+
+### Functional Coverage (accel_coverage.sv)
+covergroup accel_cg with function sample(accel_seq_item item);
+  // Cover zero weight matrix
+  cp_zero_weights: coverpoint (item.weights.sum() == 0) { bins zero = {1}; }
+  // Cover max value inputs
+  cp_max_input: coverpoint item.inputs[0][0] {
+    bins low    = {[0:63]};
+    bins high   = {[64:127]};
+    bins max    = {127};
+  }
+  // Cover back-to-back transactions (cross coverage)
+  cp_consecutive: coverpoint consecutive_txn_count {
+    bins single = {1};
+    bins burst  = {[2:5]};
+    bins stress = {[6:$]};
+  }
+endgroup
+
+Target: 90% coverage closure before declaring verification complete.
+
+### Reference Model
+The scoreboard must use an independent C++ reference model via DPI-C,
+not a SystemVerilog reimplementation of the same algorithm.
+Generate a simple C function:
+  void matmul_ref(uint8_t *weights, uint8_t *inputs, 
+                  uint32_t *outputs, int size);
+Call it from the scoreboard to get expected values.
+This is industry practice — the reference model must be algorithmically 
+independent of the RTL.
+
+---
+
+## Phase 5: Formal Verification
+
+### SymbiYosys Setup
+Create .sby configuration files for two targets:
+
+1. formal/axi_slave.sby — Verify AXI4-Lite slave protocol
+   Prove these properties:
+   - AWVALID never drops without AWREADY (write address channel)
+   - WVALID never drops without WREADY (write data channel)  
+   - ARVALID never drops without ARREADY (read address channel)
+   - RVALID is only asserted after a valid ARVALID/ARREADY handshake
+   - BRESP is always OKAY or SLVERR, never an undefined value
+   Use bounded model checking, depth = 20 cycles
+
+2. formal/hazard_unit.sby — Verify CPU hazard detection
+   Prove these properties:
+   - If EX stage has a load instruction and ID stage reads the same register,
+     a stall is always generated
+   - A forwarding path is always selected when a RAW hazard exists
+     without a load-use dependency
+   - No instruction ever reads a stale register value (the key safety property)
+   Use bounded model checking, depth = 15 cycles
+
+---
+
+## Phase 6: Bare-Metal Software (PS Side)
+
+### accel_driver.c
+Write a complete bare-metal C driver targeting the ARM Cortex-A9 PS:
+
+#define ACCEL_BASE      0x40000000
+#define CTRL_OFFSET     0x000
+#define STATUS_OFFSET   0x004
+#define WEIGHT_OFFSET   0x100
+#define OUTPUT_OFFSET   0x200
+
+Functions to implement:
+  void accel_reset(void);
+  void accel_load_weights(uint8_t weights[8][8]);
+  void accel_stream_inputs(uint8_t inputs[8][8]);  // via AXI-Stream
+  void accel_start(void);
+  int  accel_wait_done(uint32_t timeout_cycles);   // returns 0 on timeout
+  void accel_read_outputs(uint32_t outputs[8]);
+  void accel_matmul(uint8_t w[8][8], uint8_t in[8][8], uint32_t out[8][8]);
+
+Benchmarking main():
+  - Implement a software reference matrix multiply on the ARM
+  - Time it using the ARM cycle counter (PMCCNTR)
+  - Run the same matrix on the accelerator
+  - Time the full round-trip including AXI transactions
+  - Print both times over UART
+  - Assert results match to verify correctness
+  - Calculate and print speedup ratio
+
+---
+
+## Synthesis and Timing Constraints (zybo_z7.xdc)
+
+Include these constraints:
+  # Primary clock
+  create_clock -period 8.000 -name clk [get_ports clk]
+  
+  # False paths on resets
+  set_false_path -from [get_ports rst_n]
+  
+  # DSP48 timing exception for pipelined multipliers
+  set_multicycle_path -setup 2 -from [get_cells */pe_array/*] \
+    -through [get_pins */DSP48*]
+
+Target: No setup or hold violations at 125MHz after implementation.
+
+---
+
+## What To Build First (Start Here)
+
+Begin with these files in this exact order:
+
+1. rtl/cpu/riscv_pkg.sv
+   - Define all pipeline stage structs as packed structs
+   - Define instruction decode enums (opcode_t, funct3_t, funct7_t)
+   - Define forwarding select enums
+   - All subsequent CPU files import this package
+
+2. rtl/cpu/alu.sv
+   - Inputs: alu_op (from enum), a, b (32-bit)
+   - Output: result (32-bit), zero flag, overflow flag
+   - Operations: ADD, SUB, AND, OR, XOR, SLL, SRL, SRA, SLT, SLTU
+   - Purely combinational (always_comb only)
+   - This is the easiest module and validates your toolchain works
+
+3. rtl/cpu/regfile.sv
+   - 32x32-bit register file
+   - x0 hardwired to zero (never write)
+   - Two async read ports, one sync write port
+   - Forwarding-aware: if write address == read address and write enable,
+     return write data directly (bypass)
+
+4. tb/sim/alu_tb.sv
+   - Exhaustive directed tests for all ALU operations
+   - Test every edge case: overflow, zero result, shift by 0, shift by 31
+   - This is your first Verilator simulation target
+
+Do not start the systolic array or AXI work until the CPU pipeline is 
+simulating correctly with passing assembly tests. Build in order.
+
+---
+
+## Documentation Requirements
+
+After every major phase, update docs/architecture.md with:
+- What was built
+- Key design decisions made and why
+- Timing closure results (if synthesized)
+- Any bugs found and how they were fixed
+
+README.md must always contain:
+- Project status badge (In Progress / Phase N Complete)
+- Block diagram image (export from draw.io as PNG)
+- Timing closure results table
+- Utilization summary table
+- Performance benchmark results
+- Instructions to simulate with Verilator
+- Instructions to synthesize with Vivado
+
+This documentation matters as much as the code for the job application 
+purpose of this project. A recruiter will read the README. Make it good.
+
+---
+
+## Simulation Commands
+
+Always be able to run simulation with:
+  ./scripts/simulate.sh cpu      # Simulates CPU with directed tests
+  ./scripts/simulate.sh accel    # Simulates accelerator standalone
+  ./scripts/simulate.sh uvm      # Runs full UVM regression
+  ./scripts/simulate.sh formal   # Runs SymbiYosys on both targets
+
+Each command should exit 0 on pass, non-zero on any failure.
+Test pass/fail must be printed clearly to stdout.
+
+---
+
+## Context For AI Assistance
+
+When I ask you to implement a module, always:
+1. Write the complete module, not a skeleton
+2. Follow every coding standard listed above without being reminded
+3. Add inline comments explaining non-obvious design decisions
+4. Flag any timing or synthesis concerns explicitly
+5. Suggest the testbench stimulus needed to verify the module
+6. Note if a design decision deviates from industry practice and why
+
+When I ask you to debug RTL:
+1. Check for common synthesis pitfalls first (latches, multiple drivers)
+2. Check reset behavior explicitly
+3. Check for off-by-one errors in pipeline register timing
+4. Suggest specific waveform signals to probe to diagnose the issue
+
+When I ask about AXI:
+1. Always reference the specific channel (AW/W/B/AR/R) by name
+2. Always confirm VALID/READY handshake semantics before implementing
+3. Flag any potential deadlock conditions
+
+My target board is a Digilent Zybo Z7-20 with a Zynq-7020.
+My toolchain is Vivado 2023.x and Verilator 5.x.
+My HDL is SystemVerilog (IEEE 1800-2017).
+I am building this as a portfolio project for FPGA/ASIC new grad job applications.
+Correctness and synthesis quality matter more than development speed.
